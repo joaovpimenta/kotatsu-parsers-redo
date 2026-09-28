@@ -287,34 +287,33 @@ internal class NexusMangas(context: MangaLoaderContext) :
 		val DATE_FORMAT = SimpleDateFormat("dd/MM/yyyy", Locale.ROOT)
 
 		val DETAILS_SCRIPT = """
-			(() => new Promise(resolve => {
-				const started = Date.now();
-				const finish = () => resolve(document.documentElement?.outerHTML || "");
-				const poll = () => {
-					const text = document.body?.innerText || "";
-					if (text.includes("Realize uma ação para continuar acessando") ||
-						(document.querySelector("h1") && text.includes("CAPÍTULOS")) ||
-						Date.now() - started > 25000) {
-						finish();
-					} else {
-						setTimeout(poll, 250);
-					}
-				};
-				poll();
-			}))()
+			(() => {
+				const key = "__nexusMangasDetailsState";
+				const state = window[key] || (window[key] = { started: Date.now() });
+				const text = document.body?.innerText || "";
+				if (text.includes("Realize uma ação para continuar acessando") ||
+					(document.querySelector("h1") && text.includes("CAPÍTULOS")) ||
+					Date.now() - state.started > 25000) {
+					return document.documentElement?.outerHTML || "";
+				}
+				return null;
+			})()
 		""".trimIndent()
 
 		val SEARCH_SCRIPT = """
-			(() => new Promise(resolve => {
+			(() => {
 				const query = __NEXUS_QUERY__;
-				const started = Date.now();
-				const finish = () => resolve(document.documentElement?.outerHTML || "");
-				const applySearch = () => {
-					const input = document.querySelector('input[type="search"], input[type="text"], input:not([type])');
-					if (!input && Date.now() - started < 15000) {
-						setTimeout(applySearch, 250);
-						return;
-					}
+				const key = "__nexusMangasSearchState";
+				let state = window[key];
+				if (!state || state.query !== query) {
+					state = window[key] = { query, started: Date.now(), submitted: false };
+				}
+				const text = () => document.body?.innerText || "";
+				const finish = () => document.documentElement?.outerHTML || "";
+				const input = document.querySelector('input[type="search"], input[type="text"], input:not([type])');
+
+				if (!state.submitted) {
+					if (!input && Date.now() - state.started < 15000) return null;
 					if (input) {
 						const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
 						if (setter) setter.call(input, query); else input.value = query;
@@ -323,94 +322,123 @@ internal class NexusMangas(context: MangaLoaderContext) :
 						input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true }));
 						input.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true }));
 					}
-					const waitForResults = () => {
-						const text = document.body?.innerText || "";
-						const links = document.querySelectorAll('a[href*="/obra/"]').length;
-						if (text.includes("Realize uma ação para continuar acessando") ||
-							(links > 0 && text.includes("resultados")) ||
-							text.includes("0 resultados") || Date.now() - started > 30000) {
-							finish();
-						} else {
-							setTimeout(waitForResults, 250);
-						}
-					};
-					waitForResults();
-				};
-				applySearch();
-			}))()
+					state.submitted = true;
+					return null;
+				}
+
+				const links = document.querySelectorAll('a[href*="/obra/"]').length;
+				if (text().includes("Realize uma ação para continuar acessando") ||
+					(links > 0 && text().toLocaleLowerCase().includes("resultados")) ||
+					text().includes("0 resultados") || Date.now() - state.started > 30000) {
+					return finish();
+				}
+				return null;
+			})()
 		""".trimIndent()
 
 		val RANKING_SCRIPT = """
-			(() => new Promise(resolve => {
+			(() => {
 				const targetPage = __NEXUS_PAGE__;
-				const started = Date.now();
-				const sleep = ms => new Promise(done => setTimeout(done, ms));
+				const key = "__nexusMangasRankingState";
+				const state = window[key] || (window[key] = {
+					started: Date.now(),
+					worksSelected: false,
+					page: 1,
+					pageRequested: false,
+					previousLinks: "",
+					selectRequested: false,
+				});
 				const text = () => document.body?.innerText || "";
-				const finish = () => resolve(document.documentElement?.outerHTML || "");
+				const finish = () => document.documentElement?.outerHTML || "";
 				const findButton = label => Array.from(document.querySelectorAll("button"))
 					.find(button => (button.innerText || "").trim().toLocaleUpperCase() === label);
-				const poll = async () => {
-					if (text().includes("Realize uma ação para continuar acessando")) return finish();
-					const obrasButton = findButton("OBRAS");
-					if (obrasButton && !text().includes("OBRAS MAIS VISTAS")) {
-						obrasButton.click();
-						await sleep(1200);
+				const links = () => Array.from(document.querySelectorAll('a[href*="/obra/"]'))
+					.map(link => link.getAttribute("href") || "")
+					.join("|");
+
+				if (text().includes("Realize uma ação para continuar acessando")) return finish();
+
+				if (!state.worksSelected) {
+					if (text().includes("OBRAS MAIS VISTAS")) {
+						state.worksSelected = true;
+					} else {
+						const obrasButton = findButton("OBRAS");
+						if (obrasButton && !state.selectRequested) {
+							state.selectRequested = true;
+							obrasButton.click();
+							return null;
+						}
+						if (Date.now() - state.started < 25000) return null;
+						return finish();
 					}
-					if (document.querySelectorAll('a[href*="/obra/"]').length === 0 && Date.now() - started < 25000) {
-						setTimeout(poll, 250);
-						return;
-					}
-					for (let page = 1; page < targetPage; page++) {
+				}
+
+				if (state.page < targetPage) {
+					if (!state.pageRequested) {
 						const next = findButton("PRÓXIMA");
-						if (!next || next.disabled) break;
+						if (!next || next.disabled) return finish();
+						state.previousLinks = links();
+						state.pageRequested = true;
 						next.click();
-						await sleep(900);
+						return null;
 					}
-					finish();
-				};
-				poll();
-			}))()
+					if (links() !== state.previousLinks) {
+						state.page++;
+						state.pageRequested = false;
+					} else if (Date.now() - state.started < 25000) {
+						return null;
+					} else {
+						return finish();
+					}
+				}
+
+				if (document.querySelectorAll('a[href*="/obra/"]').length > 0 ||
+					Date.now() - state.started >= 25000) return finish();
+				return null;
+			})()
 		""".trimIndent()
 
 		val PAGES_SCRIPT = """
-			(() => new Promise(resolve => {
-				const started = Date.now();
-				const sleep = ms => new Promise(done => setTimeout(done, ms));
+			(() => {
+				const key = "__nexusMangasPagesState";
+				const state = window[key] || (window[key] = {
+					started: Date.now(),
+					previousCount: -1,
+					stablePasses: 0,
+				});
 				const isBlocked = () => (document.body?.innerText || "")
 					.includes("Realize uma ação para continuar acessando");
 				const pageImages = () => Array.from(document.querySelectorAll("img[alt]"))
-					.filter(image => /^Página\\s+\\d+$/i.test((image.getAttribute("alt") || "").trim()));
+					.filter(image => /^Página\s+\d+$/i.test((image.getAttribute("alt") || "").trim()));
 				const finish = () => {
 					for (const image of pageImages()) {
 						const url = image.currentSrc || image.getAttribute("src") || image.getAttribute("data-src") || "";
 						if (url) image.setAttribute("data-kotatsu-page-url", url);
 					}
-					resolve(document.documentElement?.outerHTML || "");
+					return document.documentElement?.outerHTML || "";
 				};
-				const load = async () => {
-					while (Date.now() - started < 30000 && pageImages().length === 0 && !isBlocked()) await sleep(250);
-					if (isBlocked()) return finish();
-					let previousCount = 0;
-					for (let pass = 0; pass < 16 && Date.now() - started < 38000; pass++) {
-						if (isBlocked()) return finish();
-						const images = pageImages();
-						if (images.length === 0) break;
-						for (const image of images) {
-							if (isBlocked()) return finish();
-						image.scrollIntoView({ block: "center" });
-						await sleep(120);
-						const url = image.currentSrc || image.getAttribute("src") || image.getAttribute("data-src") || "";
-						if (url) image.setAttribute("data-kotatsu-page-url", url);
-					}
-					await sleep(350);
-					const count = pageImages().length;
-					if (count === previousCount) break;
-					previousCount = count;
+
+				if (isBlocked()) return finish();
+				const images = pageImages();
+				if (images.length === 0) {
+					return Date.now() - state.started < 30000 ? null : finish();
 				}
-					finish();
-				};
-				load();
-			}))()
+
+				for (const image of images) {
+					image.scrollIntoView({ block: "center" });
+					const url = image.currentSrc || image.getAttribute("src") || image.getAttribute("data-src") || "";
+					if (url) image.setAttribute("data-kotatsu-page-url", url);
+				}
+
+				if (images.length === state.previousCount) {
+					state.stablePasses++;
+				} else {
+					state.previousCount = images.length;
+					state.stablePasses = 0;
+				}
+				if (state.stablePasses >= 2 || Date.now() - state.started >= 38000) return finish();
+				return null;
+			})()
 		""".trimIndent()
 	}
 }
