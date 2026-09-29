@@ -146,7 +146,7 @@ internal class NexusMangas(context: MangaLoaderContext) :
 		val document = loadRenderedDocument(chapterUrl, PAGES_SCRIPT)
 		ensureAccessIsAvailable(document, chapterUrl)
 
-		return document.select("img[data-kotatsu-page-url]")
+		val pages = document.select("img[data-kotatsu-page-url]")
 			.mapNotNull { image ->
 				val url = image.attr("data-kotatsu-page-url")
 					.takeIf { it.isNotBlank() && !it.startsWith("data:") }
@@ -159,6 +159,10 @@ internal class NexusMangas(context: MangaLoaderContext) :
 				)
 			}
 			.distinctBy { it.url }
+		if (pages.isEmpty()) {
+			throw ParseException("Nexus Mangás did not return any chapter pages", chapterUrl)
+		}
+		return pages
 	}
 
 	private suspend fun loadRenderedDocument(url: String, script: String): Document {
@@ -509,9 +513,16 @@ internal class NexusMangas(context: MangaLoaderContext) :
 				};
 				const pageImages = () => Array.from(document.querySelectorAll("img[alt]"))
 					.filter(image => /^Página\s+\d+$/i.test((image.getAttribute("alt") || "").trim()));
+				const pageUrl = image => [
+					image.currentSrc,
+					image.getAttribute("src"),
+					image.getAttribute("data-src"),
+					image.getAttribute("data-lazy-src"),
+					image.getAttribute("data-original"),
+				].find(url => url && !url.startsWith("data:")) || "";
 				const finish = () => {
 					for (const image of pageImages()) {
-						const url = image.currentSrc || image.getAttribute("src") || image.getAttribute("data-src") || "";
+						const url = pageUrl(image);
 						if (url) image.setAttribute("data-kotatsu-page-url", url);
 					}
 					return document.documentElement?.outerHTML || "";
@@ -525,7 +536,7 @@ internal class NexusMangas(context: MangaLoaderContext) :
 
 				for (const image of images) {
 					image.scrollIntoView({ block: "center" });
-					const url = image.currentSrc || image.getAttribute("src") || image.getAttribute("data-src") || "";
+					const url = pageUrl(image);
 					if (url) image.setAttribute("data-kotatsu-page-url", url);
 				}
 

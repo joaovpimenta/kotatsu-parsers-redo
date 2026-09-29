@@ -105,10 +105,62 @@ internal class NexusMangasWebViewTest {
 		assertTrue(chapter.uploadDate > 0L)
 	}
 
+	@Test
+	fun pagesIncludeOnlyRenderedChapterPagesAndSkipAdImages() = runTest {
+		val parser = NexusMangas(
+			PromiseAwareContext(
+				detailsHtml = PromiseAwareContext.RENDERED_ONE_PIECE_DETAILS,
+				pageHtml = PromiseAwareContext.RENDERED_ONE_PIECE_PAGES,
+			),
+		)
+		val manga = parser.getList(
+			offset = 0,
+			order = SortOrder.RELEVANCE,
+			filter = MangaListFilter(query = "One Piece"),
+		).first()
+		val chapter = parser.getDetails(manga).chapters.orEmpty().first()
+
+		val pages = parser.getPages(chapter)
+
+		assertEquals(
+			listOf(
+				"https://cdn.nexusmangas.com/one-piece/1194/1.webp",
+				"https://cdn.nexusmangas.com/one-piece/1194/2.webp",
+			),
+			pages.map { it.url },
+		)
+	}
+
+	@Test
+	fun pagesWithoutImagesFailInsteadOfReturningAnEmptyChapter() = runTest {
+		val parser = NexusMangas(
+			PromiseAwareContext(
+				detailsHtml = PromiseAwareContext.RENDERED_ONE_PIECE_DETAILS,
+				pageHtml = "<html><body>Capítulo indisponível</body></html>",
+			),
+		)
+		val manga = parser.getList(
+			offset = 0,
+			order = SortOrder.RELEVANCE,
+			filter = MangaListFilter(query = "One Piece"),
+		).first()
+		val chapter = parser.getDetails(manga).chapters.orEmpty().first()
+
+		val error = try {
+			parser.getPages(chapter)
+			throw AssertionError("Expected empty chapter pages to be reported as a parse error")
+		} catch (e: org.koitharu.kotatsu.parsers.exception.ParseException) {
+			e
+		}
+
+		assertEquals("https://www.nexusmangas.com/capitulo/one-piece/1194", error.url)
+	}
+
 	private class BrowserActionRequested(val url: String) : RuntimeException()
 
 	private class PromiseAwareContext(
 		private val detailsHtml: String = RENDERED_ACCESS_GATE,
+		private val pageHtml: String = RENDERED_ONE_PIECE_PAGES,
 	) : MangaLoaderContext() {
 
 		private val delegate = MangaLoaderContextMock
@@ -126,6 +178,7 @@ internal class NexusMangasWebViewTest {
 				script.contains("__nexusMangasSearchState") && script.contains("One Piece") -> RENDERED_ONE_PIECE_SEARCH
 				script.contains("__nexusMangasSearchState") -> RENDERED_SEARCH
 				script.contains("__nexusMangasDetailsState") -> detailsHtml
+				script.contains("__nexusMangasPagesState") -> pageHtml
 				else -> RENDERED_RANKING
 			}
 			return JSONObject.quote(html)
@@ -200,6 +253,14 @@ internal class NexusMangasWebViewTest {
 							</div>
 						</div>
 					</main>
+				</body></html>
+			"""
+			const val RENDERED_ONE_PIECE_PAGES = """
+				<html><body>
+					<img alt="Anúncio patrocinado" src="https://ads.example/ad.webp" />
+					<img alt="Página 1" data-kotatsu-page-url="https://cdn.nexusmangas.com/one-piece/1194/1.webp" />
+					<img alt="Página 2" data-kotatsu-page-url="https://cdn.nexusmangas.com/one-piece/1194/2.webp" />
+					<img alt="Página 3" data-kotatsu-page-url="data:image/gif;base64,AAAA" />
 				</body></html>
 			"""
 			const val RENDERED_SEARCH = """
