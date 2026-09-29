@@ -10,6 +10,7 @@ import org.koitharu.kotatsu.parsers.exception.ParseException
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.site.madara.MadaraParser
 import org.koitharu.kotatsu.parsers.util.*
+import java.util.Locale
 
 internal abstract class MangaCatalogParser(
     context: MangaLoaderContext,
@@ -136,6 +137,20 @@ internal abstract class MangaCatalogParser(
     private suspend fun captureDocument(url: String): Document {
         val script = """
             (() => {
+                const pageText = (document.body?.innerText || "").toLocaleLowerCase();
+                const hasLeitorReaderGate = pageText.includes("um passo para ler") &&
+                    Array.from(document.querySelectorAll("a[href]")).some(link =>
+                        (link.innerText || "").trim().toLocaleLowerCase().includes("acesse aqui para continuar")
+                    );
+                const hasVerificationChallenge = document.querySelector('$MANUAL_ACTION_SELECTORS') !== null ||
+                    ["checking your browser", "verify you are human", "human verification", "security verification",
+                     "verifique se você é humano", "verifique que você é humano"]
+                        .some(message => pageText.includes(message));
+                if (hasLeitorReaderGate || hasVerificationChallenge) {
+                    window.stop();
+                    return document.documentElement.outerHTML;
+                }
+
                 const hasReadingContent = document.querySelector('div.reading-content') !== null ||
                     document.querySelector('div.page-break') !== null ||
                     document.querySelector('img[data-src]') !== null ||
@@ -167,7 +182,37 @@ internal abstract class MangaCatalogParser(
                     match.groupValues[1].toInt(16).toChar().toString()
                 }
         } else rawHtml
-        return Jsoup.parse(html, url)
+        val document = Jsoup.parse(html, url)
+        if (requiresManualBrowserAction(document)) {
+            context.requestBrowserAction(this, url)
+        }
+        return document
+    }
+
+    private fun requiresManualBrowserAction(document: Document): Boolean {
+        val text = document.body()?.text().orEmpty()
+        val normalizedText = text.lowercase(Locale.ROOT)
+        val hasLeitorReaderGate = "um passo para ler" in normalizedText &&
+            document.select("a[href]").any {
+                it.text().contains("acesse aqui para continuar", ignoreCase = true)
+            }
+        val hasVerificationChallenge = document.selectFirst(MANUAL_ACTION_SELECTORS) != null ||
+            listOf(
+                "checking your browser",
+                "verify you are human",
+                "human verification",
+                "security verification",
+                "verifique se você é humano",
+                "verifique que você é humano",
+            ).any(normalizedText::contains)
+        return hasLeitorReaderGate || hasVerificationChallenge
+    }
+
+    private companion object {
+        const val MANUAL_ACTION_SELECTORS = "#challenge-form, #challenge-running, #cf-challenge-running, " +
+            ".cf-browser-verification, .cf-turnstile, [name=\"cf-turnstile-response\"], " +
+            "iframe[src*=\"challenges.cloudflare.com\"], .g-recaptcha, iframe[src*=\"recaptcha\"], " +
+            ".h-captcha, iframe[src*=\"hcaptcha.com\"]"
     }
 }
 
