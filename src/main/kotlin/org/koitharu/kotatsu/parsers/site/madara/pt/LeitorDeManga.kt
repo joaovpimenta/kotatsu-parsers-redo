@@ -1,5 +1,6 @@
 package org.koitharu.kotatsu.parsers.site.madara.pt
 
+import org.json.JSONArray
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
@@ -10,119 +11,170 @@ import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.site.madara.MadaraParser
 import org.koitharu.kotatsu.parsers.util.*
 
-@MangaSourceParser("LEITORDEMANGA", "LeitorDeManga", "pt")
-internal class LeitorDeManga(context: MangaLoaderContext) :
-	MadaraParser(context, MangaParserSource.LEITORDEMANGA, "leitordemanga.com", 10) {
-	override val datePattern = "dd/MM/yyyy"
-	override val listUrl = "ler-manga/"
+internal abstract class MangaCatalogParser(
+    context: MangaLoaderContext,
+    source: MangaParserSource,
+    domain: String,
+) : MadaraParser(context, source, domain, 10) {
+    override val datePattern = "d 'de' MMMM 'de' yyyy"
+    override val listUrl = "manga/"
+    override val stylePage = "?style=paged"
 
-	override suspend fun getDetails(manga: Manga): Manga {
-		val fullUrl = manga.url.toAbsoluteUrl(domain)
-		val doc = captureDocument(fullUrl)
-
-		// Use the same logic as parent but with captured document
-		return manga.copy(
-			chapters = loadChapters(manga.url, doc)
-		)
-	}
+    override val filterCapabilities = MangaListFilterCapabilities(
+        isSearchSupported = true,
+    )
 
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
         keys.add(ConfigKey.DisableUpdateChecking(defaultValue = true))
     }
 
-	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-		val pages = page + 1
-		val url = buildString {
-			append("https://")
-			append(domain)
+    override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+        val pageNumber = page + 1
+        val url = buildString {
+            append("https://")
+            append(domain)
+            when {
+                !filter.query.isNullOrEmpty() -> append("/?s=${filter.query.urlEncoded()}&post_type=wp-manga")
+                filter.tags.isNotEmpty() -> append("/manga-genre/${filter.tags.oneOrThrowIfMany()?.key}/")
+                else -> {
+                    append("/")
+                    append(listUrl)
+                    if (pageNumber > 1) append("page/$pageNumber/")
+                }
+            }
+        }
+        return parseMangaList(captureDocument(url))
+    }
 
-			if (pages > 1) {
-				append("/page/")
-				append(pages.toString())
-			}
+    override fun parseMangaList(doc: Document): List<Manga> {
+        val items = doc.select("#loop-content > .page-listing-item")
+        if (items.isEmpty()) return super.parseMangaList(doc)
+        return items.mapNotNull { item ->
+            val a = item.selectFirst("a[href]") ?: return@mapNotNull null
+            val href = a.attrAsRelativeUrl("href")
+            val title = item.selectFirst(".post-title, .manga-name, h3, h4")?.text()?.trim()
+                ?.takeIf(String::isNotEmpty) ?: a.text().trim()
+            if (title.isEmpty() || href.isEmpty()) return@mapNotNull null
+            Manga(
+                id = generateUid(href),
+                url = href,
+                publicUrl = href.toAbsoluteUrl(item.host ?: domain),
+                title = title,
+                altTitles = emptySet(),
+                authors = emptySet(),
+                coverUrl = item.selectFirst("img")?.src(),
+                tags = emptySet(),
+                rating = RATING_UNKNOWN,
+                state = null,
+                source = source,
+                contentRating = if (isNsfwSource) ContentRating.ADULT else null,
+            )
+        }
+    }
 
-			append(when {
-				!filter.query.isNullOrEmpty() -> "/?s=${filter.query.urlEncoded()}&post_type=wp-manga"
-				filter.tags.isNotEmpty() -> "/$tagPrefix${filter.tags.oneOrThrowIfMany()?.key}/"
-				else -> "/$listUrl"
-			})
+    override suspend fun getDetails(manga: Manga): Manga {
+        val fullUrl = manga.url.toAbsoluteUrl(domain)
+        val doc = captureDocument(fullUrl)
+        val href = doc.selectFirst("head meta[property='og:url']")?.attr("content")
+            ?.toRelativeUrl(domain) ?: manga.url
+        val chapters = if (doc.select(selectTestAsync).isEmpty()) {
+            loadChapters(href, doc)
+        } else {
+            getChapters(manga, doc)
+        }
+        val stateDiv = doc.selectFirst(selectState)?.selectLast("div.summary-content")
+        val state = stateDiv?.let {
+            when (it.text().lowercase()) {
+                in ongoing -> MangaState.ONGOING
+                in finished -> MangaState.FINISHED
+                in abandoned -> MangaState.ABANDONED
+                in paused -> MangaState.PAUSED
+                else -> null
+            }
+        }
+        val alt = doc.body().select(selectAlt).firstOrNull()?.tableValue()?.textOrNull()
+        return manga.copy(
+            title = doc.selectFirst("h1")?.textOrNull() ?: manga.title,
+            url = href,
+            publicUrl = href.toAbsoluteUrl(domain),
+            tags = doc.body().select(selectGenre).mapNotNull { createMangaTag(it) }.toSet(),
+            description = doc.select(selectDesc).html(),
+            altTitles = setOfNotNull(alt),
+            state = state,
+            chapters = chapters,
+            contentRating = if (doc.selectFirst(".adult-confirm") != null || isNsfwSource) {
+                ContentRating.ADULT
+            } else {
+                ContentRating.SAFE
+            },
+        )
+    }
 
-			if (pages > 1 && filter.tags.isEmpty() && filter.query.isNullOrEmpty()) {
-				append("page/$pages/")
-			}
-		}
+    override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
+        val fullUrl = chapter.url.toAbsoluteUrl(domain)
+        val doc = captureDocument(fullUrl)
+        val script = doc.selectFirst("#chapter_preloaded_images")?.data()
+        if (script != null) {
+            val rawArray = script.substringAfter("var chapter_preloaded_images = [")
+                .substringBefore("]")
+            val images = JSONArray("[$rawArray]")
+            if (images.length() == 0) throw ParseException("No pages found", fullUrl)
+            return (0 until images.length()).map { index ->
+                val imageUrl = images.getString(index).toRelativeUrl(domain)
+                MangaPage(
+                    id = generateUid(imageUrl),
+                    url = imageUrl,
+                    preview = null,
+                    source = source,
+                )
+            }
+        }
+        return super.getPages(chapter)
+    }
 
-		val doc = captureDocument(url)
-		return parseMangaList(doc)
-	}
-
-	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		val fullUrl = chapter.url.toAbsoluteUrl(domain)
-
-		// Always use captureDocument since the site always shows browser check
-		val doc = captureDocument(fullUrl)
-
-		// Parse using standard Madara selectors (no chapter protector)
-		val root = doc.body().selectFirst(selectBodyPage) ?: throw ParseException(
-			"No image found",
-			fullUrl,
-		)
-
-		return root.select(selectPage).flatMap { div ->
-			div.selectOrThrow("img").map { img ->
-				val url = img.requireSrc().toRelativeUrl(domain)
-				MangaPage(
-					id = generateUid(url),
-					url = url,
-					preview = null,
-					source = source,
-				)
-			}
-		}
-	}
-
-	private suspend fun captureDocument(url: String): Document {
-		val script = """
-			(() => {
-				// Check for different types of content
-				const hasReadingContent = document.querySelector('div.reading-content') !== null ||
-										   document.querySelector('div.page-break') !== null ||
-										   document.querySelector('img[data-src]') !== null;
-
-				const hasMangaList = document.querySelector('div.page-listing-item') !== null ||
-									 document.querySelector('div.page-item-detail') !== null ||
-									 document.querySelector('.wp-manga-item') !== null;
-
-				const hasMangaDetails = document.querySelector('div.summary_content') !== null ||
-										document.querySelector('.manga-chapters') !== null ||
-										document.querySelector('.post-title') !== null;
-
-				// If any expected content is found, stop loading and return HTML
-				if (hasReadingContent || hasMangaList || hasMangaDetails) {
-					window.stop();
-					const elementsToRemove = document.querySelectorAll('script, iframe, object, embed, style');
-					elementsToRemove.forEach(el => el.remove());
-					return document.documentElement.outerHTML;
-				}
-				return null;
-			})();
-		""".trimIndent()
-
-		val rawHtml = context.evaluateJs(url, script, 30000L) ?: throw ParseException("Failed to load page", url)
-
-		val html = if (rawHtml.startsWith("\"") && rawHtml.endsWith("\"")) {
-			rawHtml.substring(1, rawHtml.length - 1)
-				.replace("\\\"", "\"")
-				.replace("\\n", "\n")
-				.replace("\\r", "\r")
-				.replace("\\t", "\t")
-				.replace(Regex("""\\u([0-9A-Fa-f]{4})""")) { match ->
-					val hexValue = match.groupValues[1]
-					hexValue.toInt(16).toChar().toString()
-				}
-		} else rawHtml
-
-		return Jsoup.parse(html, url)
-	}
+    private suspend fun captureDocument(url: String): Document {
+        val script = """
+            (() => {
+                const hasReadingContent = document.querySelector('div.reading-content') !== null ||
+                    document.querySelector('div.page-break') !== null ||
+                    document.querySelector('img[data-src]') !== null ||
+                    document.querySelector('#chapter_preloaded_images') !== null;
+                const hasMangaList = document.querySelector('#loop-content > .page-listing-item') !== null ||
+                    document.querySelector('div.page-item-detail') !== null ||
+                    document.querySelector('.wp-manga-item') !== null;
+                const hasMangaDetails = document.querySelector('div.summary_content') !== null ||
+                    document.querySelector('.manga-chapters') !== null ||
+                    document.querySelector('.post-title') !== null;
+                if (hasReadingContent || hasMangaList || hasMangaDetails) {
+                    window.stop();
+                    document.querySelectorAll('script:not(#chapter_preloaded_images), iframe, object, embed, style')
+                        .forEach(el => el.remove());
+                    return document.documentElement.outerHTML;
+                }
+                return null;
+            })();
+        """.trimIndent()
+        val rawHtml = context.evaluateJs(url, script, 30000L)
+            ?: throw ParseException("Failed to load page", url)
+        val html = if (rawHtml.startsWith("\"") && rawHtml.endsWith("\"")) {
+            rawHtml.substring(1, rawHtml.length - 1)
+                .replace("\\\"", "\"")
+                .replace("\\n", "\n")
+                .replace("\\r", "\r")
+                .replace("\\t", "\t")
+                .replace(Regex("""\\u([0-9A-Fa-f]{4})""")) { match ->
+                    match.groupValues[1].toInt(16).toChar().toString()
+                }
+        } else rawHtml
+        return Jsoup.parse(html, url)
+    }
 }
+
+@MangaSourceParser("LEITORDEMANGA", "LeitorDeManga", "pt")
+internal class LeitorDeManga(context: MangaLoaderContext) :
+    MangaCatalogParser(context, MangaParserSource.LEITORDEMANGA, "leitordemangas.com")
+
+@MangaSourceParser("MANGASBRASUKAS", "Mangas Brasukas", "pt")
+internal class MangasBrasukas(context: MangaLoaderContext) :
+    MangaCatalogParser(context, MangaParserSource.MANGASBRASUKAS, "mangasbrasuka.org")

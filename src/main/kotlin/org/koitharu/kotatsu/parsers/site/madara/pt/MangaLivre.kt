@@ -2,6 +2,7 @@ package org.koitharu.kotatsu.parsers.site.madara.pt
 
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
+import org.koitharu.kotatsu.parsers.Broken
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
@@ -12,6 +13,7 @@ import org.koitharu.kotatsu.parsers.network.CloudFlareHelper
 import org.koitharu.kotatsu.parsers.site.madara.MadaraParser
 import org.koitharu.kotatsu.parsers.util.*
 
+@Broken
 @MangaSourceParser("MANGALIVRE", "Manga Livre", "pt")
 internal class MangaLivre(context: MangaLoaderContext) :
     MadaraParser(context, MangaParserSource.MANGALIVRE, "mangalivre.tv") {

@@ -7,6 +7,7 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import okhttp3.Headers
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
+import org.koitharu.kotatsu.parsers.MangaParser
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
@@ -77,6 +78,15 @@ internal class NexusMangas(context: MangaLoaderContext) :
 		val mangaUrl = manga.publicUrl.ifBlank { manga.url.toAbsoluteUrl(domain) }
 		val document = loadRenderedDocument(mangaUrl, DETAILS_SCRIPT)
 		ensureAccessIsAvailable(document, mangaUrl)
+		val chapterScan = document.selectFirst("[data-kotatsu-chapter-scan]")
+		val expectedChapterCount = chapterScan?.attr("data-total")?.toIntOrNull()
+		val capturedChapterCount = chapterScan?.attr("data-captured")?.toIntOrNull()
+		if (expectedChapterCount != null && capturedChapterCount != null && capturedChapterCount < expectedChapterCount) {
+			throw ParseException(
+				"Nexus Mangás loaded $capturedChapterCount of $expectedChapterCount chapters",
+				mangaUrl,
+			)
+		}
 
 		val bodyText = document.body()?.wholeText().orEmpty()
 		val title = document.selectFirst("main h1, h1")?.text()?.trim()?.takeIf(String::isNotEmpty)
@@ -165,13 +175,17 @@ internal class NexusMangas(context: MangaLoaderContext) :
 				if (!url.startsWith("/obra/")) return@mapNotNull null
 
 				val linkText = link.text().trim()
-				val title = link.selectFirst("h2, h3, h4")?.text()?.trim()?.takeIf(String::isNotEmpty)
+				val heading = link.selectFirst("h2, h3, h4")
+				val title = heading?.attr("title")?.trim()?.takeIf(String::isNotEmpty)
+					?: heading?.text()?.trim()?.takeIf(String::isNotEmpty)
 					?: link.attr("aria-label").takeIf(String::isNotEmpty)
 					?: cleanCardTitle(linkText)
 				if (title.isBlank()) return@mapNotNull null
 
 				val image = link.selectFirst("img")?.let(::imageUrl)
-				val statusText = linkText.lowercase(Locale.ROOT)
+				val statusText = (
+					linkText + " " + link.select("span").joinToString(" ") { it.text() }
+				).lowercase(Locale.ROOT)
 				Manga(
 					id = generateUid(url),
 					title = title,
@@ -199,7 +213,12 @@ internal class NexusMangas(context: MangaLoaderContext) :
 			val numberText = match.groupValues[1].replace(',', '.')
 			val number = numberText.toFloatOrNull() ?: return@mapNotNull null
 			val path = "/capitulo/$slug/$numberText"
+			val row = element.parents().firstOrNull { ancestor ->
+				ancestor.hasClass("cursor-pointer") && ancestor.text().contains(numberText)
+			}
 			val title = match.groupValues.getOrNull(2)?.trim()?.takeIf(String::isNotEmpty)
+				?: row?.selectFirst("span[class*=truncate]")?.text()?.trim()?.replaceFirst(Regex("^[-–—]\\s*"), "")
+					?.takeIf(String::isNotEmpty)
 			MangaChapter(
 				id = generateUid(path),
 				title = title,
@@ -207,7 +226,7 @@ internal class NexusMangas(context: MangaLoaderContext) :
 				volume = 0,
 				url = path,
 				scanlator = null,
-				uploadDate = parseUploadDate(element),
+				uploadDate = parseUploadDate(row ?: element),
 				branch = null,
 				source = source,
 			)
@@ -218,9 +237,8 @@ internal class NexusMangas(context: MangaLoaderContext) :
 	}
 
 	private fun parseUploadDate(element: Element): Long {
-		val parentText = element.parent()?.text().orEmpty()
-		val date = DATE_REGEX.find(parentText)?.value ?: return 0L
-		return runCatching { DATE_FORMAT.parse(date)?.time }.getOrNull() ?: 0L
+		val date = DATE_REGEX.find(element.text())?.value ?: return 0L
+		return runCatching { SimpleDateFormat(DATE_FORMAT_PATTERN, Locale.ROOT).parse(date)?.time }.getOrNull() ?: 0L
 	}
 
 	private fun cleanCardTitle(text: String): String {
@@ -251,6 +269,7 @@ internal class NexusMangas(context: MangaLoaderContext) :
 		return when {
 			"concluída" in normalized || "concluído" in normalized ||
 				"finalizado" in normalized || "finalizada" in normalized -> MangaState.FINISHED
+			ACTIVE_STATUS_REGEX.containsMatchIn(normalized) -> MangaState.ONGOING
 			"em andamento" in normalized || "em lançamento" in normalized ||
 				"andamento" in normalized -> MangaState.ONGOING
 			else -> null
@@ -271,7 +290,7 @@ internal class NexusMangas(context: MangaLoaderContext) :
 		if (text.contains("Realize uma ação para continuar acessando o conteúdo deste site", ignoreCase = true) ||
 			text.contains("Acesso a todo o site por 24 horas", ignoreCase = true)
 		) {
-			throw ParseException("Nexus Mangás requires an access action in its website", url)
+			context.requestBrowserAction(this, url)
 		}
 	}
 
@@ -284,18 +303,93 @@ internal class NexusMangas(context: MangaLoaderContext) :
 		const val WEBVIEW_TIMEOUT = 45000L
 		val CHAPTER_LINE_REGEX = Regex("(?i)^Cap\\.\\s*([0-9]+(?:[.,][0-9]+)?)(?:\\s*[-–]\\s*(.*))?$")
 		val DATE_REGEX = Regex("\\b\\d{2}/\\d{2}/\\d{4}\\b")
-		val DATE_FORMAT = SimpleDateFormat("dd/MM/yyyy", Locale.ROOT)
+		val ACTIVE_STATUS_REGEX = Regex("""\bativ[oa]s?\b""")
+		const val DATE_FORMAT_PATTERN = "dd/MM/yyyy"
 
 		val DETAILS_SCRIPT = """
 			(() => {
 				const key = "__nexusMangasDetailsState";
-				const state = window[key] || (window[key] = { started: Date.now() });
+				const state = window[key] || (window[key] = {
+					started: Date.now(),
+					previousCount: 0,
+					stablePasses: 0,
+					chapters: new Map(),
+					total: null,
+				});
 				const text = document.body?.innerText || "";
+				const finish = () => {
+					const root = document.documentElement?.cloneNode(true);
+					const body = root?.querySelector("body");
+					if (body) {
+						const metadata = document.createElement("div");
+						metadata.setAttribute("data-kotatsu-chapter-scan", "");
+						metadata.setAttribute("data-total", state.total == null ? "" : String(state.total));
+						metadata.setAttribute("data-captured", String(state.chapters.size));
+						const rows = document.createElement("div");
+						rows.setAttribute("data-kotatsu-extracted-chapters", "");
+						rows.innerHTML = Array.from(state.chapters.values()).join("");
+						metadata.appendChild(rows);
+						body.appendChild(metadata);
+					}
+					return root?.outerHTML || document.documentElement?.outerHTML || "";
+				};
 				if (text.includes("Realize uma ação para continuar acessando") ||
-					(document.querySelector("h1") && text.includes("CAPÍTULOS")) ||
-					Date.now() - state.started > 25000) {
-					return document.documentElement?.outerHTML || "";
+					text.includes("Acesso a todo o site por 24 horas")) return finish();
+
+				if (!document.querySelector("h1") || !text.toLocaleUpperCase().includes("CAPÍTULOS")) {
+					return Date.now() - state.started > 25000 ? finish() : null;
 				}
+
+				const total = text.match(/(\d+)\s+lançamentos/i);
+				if (total) state.total = Number(total[1]);
+				const labels = Array.from(document.querySelectorAll("*")).filter(label => {
+					const directText = Array.from(label.childNodes)
+						.filter(node => node.nodeType === Node.TEXT_NODE)
+						.map(node => (node.textContent || "").trim())
+						.filter(Boolean)
+						.join(" ");
+					return /^Cap\.\s*\d+(?:[.,]\d+)?$/i.test(directText);
+				});
+				for (const label of labels) {
+					const row = label.closest('div[class*="cursor-pointer"]');
+					if (!row) continue;
+					const number = label.textContent.trim();
+					state.chapters.set(number + "|" + row.innerText.trim(), row.outerHTML);
+				}
+				if (labels.length === 0) {
+					return Date.now() - state.started >= 40000 ? finish() : null;
+				}
+				const findScroller = label => {
+					for (let element = label?.parentElement; element; element = element.parentElement) {
+						const style = getComputedStyle(element);
+						if (element.scrollHeight > element.clientHeight + 100 && /(auto|scroll)/.test(style.overflowY)) {
+							return element;
+						}
+					}
+					return null;
+				};
+				const scroller = findScroller(labels[0]);
+				if (!scroller) return finish();
+
+				if (state.chapters.size === state.previousCount) {
+					state.stablePasses++;
+				} else {
+					state.previousCount = state.chapters.size;
+					state.stablePasses = 0;
+				}
+				const atBottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2;
+				if (atBottom) {
+					if ((state.total != null && state.chapters.size >= state.total) ||
+						(state.total == null && state.stablePasses >= 3) ||
+						state.stablePasses >= 6 || Date.now() - state.started >= 40000) {
+						return finish();
+					}
+					return null;
+				}
+				scroller.scrollTop = Math.min(
+					scroller.scrollTop + Math.max(1, Math.floor(scroller.clientHeight * 0.65)),
+					scroller.scrollHeight,
+				);
 				return null;
 			})()
 		""".trimIndent()
@@ -328,6 +422,7 @@ internal class NexusMangas(context: MangaLoaderContext) :
 
 				const links = document.querySelectorAll('a[href*="/obra/"]').length;
 				if (text().includes("Realize uma ação para continuar acessando") ||
+					text().includes("Acesso a todo o site por 24 horas") ||
 					(links > 0 && text().toLocaleLowerCase().includes("resultados")) ||
 					text().includes("0 resultados") || Date.now() - state.started > 30000) {
 					return finish();
@@ -356,7 +451,8 @@ internal class NexusMangas(context: MangaLoaderContext) :
 					.map(link => link.getAttribute("href") || "")
 					.join("|");
 
-				if (text().includes("Realize uma ação para continuar acessando")) return finish();
+				if (text().includes("Realize uma ação para continuar acessando") ||
+					text().includes("Acesso a todo o site por 24 horas")) return finish();
 
 				if (!state.worksSelected) {
 					if (text().includes("OBRAS MAIS VISTAS")) {
@@ -406,8 +502,11 @@ internal class NexusMangas(context: MangaLoaderContext) :
 					previousCount: -1,
 					stablePasses: 0,
 				});
-				const isBlocked = () => (document.body?.innerText || "")
-					.includes("Realize uma ação para continuar acessando");
+				const isBlocked = () => {
+					const text = document.body?.innerText || "";
+					return text.includes("Realize uma ação para continuar acessando") ||
+						text.includes("Acesso a todo o site por 24 horas");
+				};
 				const pageImages = () => Array.from(document.querySelectorAll("img[alt]"))
 					.filter(image => /^Página\s+\d+$/i.test((image.getAttribute("alt") || "").trim()));
 				const finish = () => {
